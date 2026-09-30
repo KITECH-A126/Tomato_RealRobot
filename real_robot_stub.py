@@ -1,21 +1,14 @@
-"""RealRobot 골격 — 이 파일을 받아서 채운다. 서명은 바꾸지 않는다.
+"""NERO·PiPER 관절 및 Orbbec 305·335 카메라의 SDK 인터페이스.
 
-정본 규약은 `02_규약_실물_구동_인터페이스 v2_09_26`이다. 이 파일은 그 규약을 코드로
-옮긴 껍데기이고, 아래 주석에 규약의 핵심만 다시 적어 뒀다.
-
-2026-09-22 합의: 장치 SDK import 허용. 관절은 pyAgxArm을 직접 사용한다.
-2026-09-28 변경: 카메라 반환은 grab_wrist=(rgb, t), grab_gaze=(rgb, depth, t).
-치수·카메라 파라미터·캘리브 결과는 이 층이 갖지 않는다.
+정본 규약: `02_규약_실물_구동_인터페이스 v2_09_26`.
 
 이 파일은 클래스와 check_shapes 함수 정의를 제공한다. import만 하면 연결하거나 검사하지 않는다.
-오프라인 검사: python -m unittest -v test_real_robot_stub test_orbbec_camera_sdk
 직접 실행하면 RealRobot()을 생성하고 check_shapes를 실행한다(실물 위치 지령 포함).
-별도 실행 진입점: python test_real_robot_shapes.py --execute
-현재 RealRobot() 생성은 실제 CAN에 연결하지만 Enable하지 않는다.
+RealRobot() 생성은 CAN에 연결하고 최종 NERO 드라이버의 속도 비율을 100%로 설정한다.
+초기화에서 Enable/위치 지령은 보내지 않는다.
 __init__에서 305/335를 각각 자동 감지하고 발견한 카메라만 스트림을 시작한다.
 없는 카메라는 건너뛰지만, 발견한 카메라의 연결 실패는 초기화 오류로 알린다.
 ROS는 사용하지 않는다. 카메라 감지를 위해 pyorbbecsdk는 설치되어 있어야 한다.
-카메라 구현도 이 파일에 포함한다. 별도 로컬 카메라 모듈은 필요 없다.
 그리퍼는 미구현이다. 시각 통계·RGB 실물 검사는 별도 작업이며 이 층에서 하지 않는다.
 """
 from collections import deque
@@ -23,20 +16,17 @@ import time
 
 import numpy as np
 
-# 관절 순서 = URDF 순서. 이름을 적어 두는 이유는 순서를 헷갈리면 재생 시험 전까지
-# 아무도 모르기 때문이다.
+# 규약의 URDF 관절 순서.
 NERO_JOINTS = tuple(f"nero_joint{i}" for i in range(1, 8))    # 7개
 PIPER_JOINTS = tuple(f"piper_joint{i}" for i in range(1, 7))  # 6개
 
 
 class RealRobot:
-    """실물 13자유도 플랫폼에 닿는 유일한 층. 함수 여섯 밖은 이 클래스의 일이 아니다."""
+    """두 팔의 관절 읽기·쓰기와 손목·시선 카메라 프레임을 제공한다."""
 
     def __init__(self, **conn):
-        """연결만 한다. conn에 담아도 되는 것은 장치 이름·포트·시리얼·스트림 모드까지다.
-
-        **기하와 관련된 숫자는 하나도 받지 않는다.** 치수가 필요해지면 그것은 이 층이
-        할 일이 아니라는 신호다.
+        """연결하고 NERO 속도 비율을 100%로 설정한다. Enable/위치 지령은 보내지 않는다.
+        conn: nero_can_port, piper_can_port, wrist_serial, gaze_serial만 허용한다.
         """
         from pyAgxArm import AgxArmFactory, create_agx_arm_config, resolve_firmware_profile
 
@@ -92,6 +82,8 @@ class RealRobot:
                     driver = AgxArmFactory.create_arm(config)
                     self._arms[arm] = driver
                     driver.connect()
+                if arm == "nero":
+                    driver.set_speed_percent(100)
                 expected = [name.split("_", 1)[1] for name in names]
                 if list(config["joint_names"]) != expected or driver.joint_nums != len(names):
                     raise RuntimeError(f"{arm}: SDK 관절 순서/개수가 규약과 다르다")
@@ -142,14 +134,29 @@ class RealRobot:
                 pipeline = sdk.Pipeline(device)
                 pipeline.disable_health_monitor()
                 try:
-                    color_profile = pipeline.get_stream_profile_list(
-                        sdk.OBSensorType.COLOR_SENSOR).get_default_video_stream_profile()
+                    color_profiles = pipeline.get_stream_profile_list(sdk.OBSensorType.COLOR_SENSOR)
                 except Exception as exc:
                     raise RuntimeError(f"{role}: 대표 Color가 없다. 좌/우 선택이나 preset 변경은 하지 않는다") from exc
+                # 두 색상 스트림 모두 명시한 원본 모드만 사용한다. 기본값 대체/resize 없음.
+                width, height, color_format, fps = (
+                    (1280, 800, sdk.OBFormat.YUYV, 30) if role == "wrist"
+                    else (1280, 720, sdk.OBFormat.MJPG, 30))
+                requested_mode = f"{width}x{height} {color_format} {fps}fps"
+                try:
+                    color_profile = color_profiles.get_video_stream_profile(
+                        width, height, color_format, fps)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{role}: Color {requested_mode}를 사용할 수 없다. 다른 모드로 대체하지 않는다"
+                    ) from exc
+                if (color_profile.get_width(), color_profile.get_height(),
+                        color_profile.get_format(), color_profile.get_fps()) != (
+                        width, height, color_format, fps):
+                    raise RuntimeError(f"{role}: SDK가 요청한 {requested_mode}와 다른 프로필을 반환했다")
                 if color_profile.get_format() not in (
                         sdk.OBFormat.RGB, sdk.OBFormat.BGR, sdk.OBFormat.MJPG,
                         sdk.OBFormat.YUYV, sdk.OBFormat.YUY2, sdk.OBFormat.UYVY):
-                    raise RuntimeError(f"{role}: 지원하지 않는 기본 Color 포맷 {color_profile.get_format()}")
+                    raise RuntimeError(f"{role}: 지원하지 않는 Color 포맷 {color_profile.get_format()}")
                 config = sdk.Config()
                 config.disable_all_stream()
                 config.enable_stream(color_profile)
@@ -174,7 +181,7 @@ class RealRobot:
                 latest = deque(maxlen=1)
                 self._camera_streams[role] = {
                     "pipeline": pipeline, "device": device, "latest": latest, "align": align}
-                # SDK callback으로 내장 deque.append를 사용한다. 추가 함수/스레드는 만들지 않는다.
+                # SDK 수신 콜백으로 최신 frameset 한 개만 보관한다.
                 pipeline.start(config, latest.append)
                 deadline = time.monotonic() + 3.0
                 while not latest:
@@ -200,13 +207,13 @@ class RealRobot:
 
             {"nero": [q1..q7],      # rad, URDF 순서
              "piper": [q1..q6],     # rad, URDF 순서
-             "grip": 0.0,           # 0.0 완전 개방 - 1.0 완전 폐합
-             "t": 1789040210.804}   # 초, 이 표본을 실제로 읽은 시각
+             "grip": 0.0,           # 임시값. 실제 그리퍼 피드백이 아니다.
+             "t": 1789040210.804}   # 두 팔 SDK 표본 시각 중 오래된 값, 초
 
         - **단위는 rad다.** 도가 아니다. 영점과 부호는 URDF와 같다.
         - `t`는 호스트 time.time() 기준 초다(SDK 시각과의 차이를 실측 보고한다).
           관절과 이미지의 `t` 차이가 33 ms를 넘으면
-          위층이 그 표본을 버린다 (시뮬은 30 Hz 한 틱 안에서 둘이 같은 순간이다).
+          위층에서 그 표본을 버려야 한다.
         - **팔 하나만 읽는 함수를 따로 두지 않는다.** 한 dict에 둘 다 담는다.
         """
         if self._closed:
@@ -243,12 +250,9 @@ class RealRobot:
         - **속도·토크 지령은 이 규약에 없다.**
         - **보내고 바로 돌아온다.** 도달을 기다리는 것은 위층이 한다.
         - 한쪽 팔만 움직이려면 다른 쪽에 방금 읽은 값을 그대로 넣어 보낸다.
-        - **받은 값을 그대로 보낸다.** 지령 사이를 보간하거나 중간점을 채우거나 궤적을
-          매끄럽게 만들지 않는다. 관절 한계로 클램프하지도 않는다. 값을 조용히 바꾸면
-          위층이 보낸 것과 로봇이 받은 것이 달라지고 **재생 시험이 그것을 못 잡는다.**
-        - **주기를 맞추려고 안에서 기다리거나 스레드를 돌리지 않는다.** 부르면 즉시
-          응답한다. 30 Hz를 맞추는 것은 위층 일이고, 아래층은 낼 수 있는 주기를 재서
-          알려 주기만 한다.
+        - 입력 검증 후 각 팔의 move_js를 한 번 호출한다. 보간·스무딩·클램프는 없다.
+          SDK가 클램프할 입력은 전송 전에 예외로 알린다.
+        - 내부 주기 조절이나 도달 대기는 없다. 호출 주기는 위층에서 관리한다.
         - **안전 정지는 위층이 갖는다.** 재생 스크립트 또는 평가 루프가 담당한다.
         """
         from pyAgxArm.utiles.validator import Validator
@@ -297,38 +301,21 @@ class RealRobot:
             self._arms[arm].move_js(prepared[arm])
 
     def set_gripper(self, grip: float) -> None:
-        """0.0 완전 개방 - 1.0 완전 폐합으로 정규화된 그리퍼 지령.
-
-        **방향만으로 부족하다. 척도의 두 끝을 실측한다.** 완전 개방과 완전 폐합에서
-        원시값(서보 각도·스트로크·인코더 무엇이든)을 읽어 그 둘을 0.0과 1.0에 대응시키고,
-        **두 원시값을 보고에 함께 적는다.** 방향이 뒤집힌 것은 재생 시험이 잡지만
-        **척도가 어긋난 것은 못 잡는다.**
-
-        첫 실기에서 실제로 쓰는 것은 개방 자세 유지뿐이다 (폐합·절단은 이연).
-        """
+        """미구현. 규약상 0.0은 완전 개방, 1.0은 완전 폐합이다."""
         raise NotImplementedError
 
     # ---------------------------------------------------------------- 카메라
     def grab_wrist(self) -> tuple:
         """NERO 손목 카메라(305). (rgb, t)를 반환한다.
 
-        rgb: (H, W, 3) uint8 RGB.
+        rgb: (800, 1280, 3) uint8 RGB (305 Color 1280x800 YUYV 30fps 수신).
         t: 대표 Color 프레임 시각(호스트 time.time() 기준 초).
         SDK global timestamp를 사용한다. 좌/우 스트림으로 자동 대체하지 않는다.
         캐시된 영상을 반환할 때 현재 호출 시각으로 덮어쓰지 않는다.
 
-        **기하는 원본 그대로 준다.** 해상도를 줄이지도 자르지도 않고 4:3으로 맞추지
-        않는다. 재표본화는 위층이 한다. 여기서 미리 손대면 변환이 두 번 걸려 정책이
-        본 적 없는 그림이 된다.
-
-        **채널 순서는 RGB로 맞춰 준다.** SDK 포맷이 BGR이면 뒤집고, RGB면 유지한다.
-        YUYV·MJPG는 RGB로 디코딩한다. 위의 "손대지 마라"는 기하에 관한 말이다.
-        **아무 검사도 이것을 못 잡는다** — 모양과 자료형이 같아 형식 검사를 통과하고,
-        증상은 시선 모듈이 목표를 놓치는 것으로 나타난다. 빨간 것을 찍어 R이 큰지 한 번
-        확인하고 넘어가라.
-
-        **부른 순간 카메라가 향한 자세에서 한 장을 돌려준다.** 더 나은 시야를 찾아 관절을
-        움직이면 시선 판단을 아래층에 숨기는 일이 된다.
+        수신 영상의 크기를 유지하며 crop/resize/왜곡 보정을 적용하지 않는다.
+        SDK 포맷에 맞춰 RGB로 변환한다. 채널 순서는 별도 실물 확인이 필요하다.
+        최신 수신 프레임을 반환한다. 호출 순간의 촬영을 보장하지 않으며 로봇을 움직이지 않는다.
         """
         if self._closed:
             raise RuntimeError("RealRobot 연결이 닫혀 있다")
@@ -378,13 +365,9 @@ class RealRobot:
         SDK global timestamp를 사용하며 캐시 시각을 현재 호출 시각으로 덮어쓰지 않는다.
         SDK의 같은 frameset 안의 깊이를 색상 격자에 정렬한다. RGB 자체는 변형하지 않는다.
 
-        - 깊이는 **색상 격자에 정렬된 것**이어야 한다.
-        - 단위는 m. 무효 화소는 `nan`이다. **0으로 채우지 않는다** — 많은 SDK가 무효를
-          0으로 주므로 이건 손봐야 하는 자리다.
-        - 색상은 RGB다(위 `grab_wrist` 참조. SDK가 BGR이면 뒤집는다).
-        - 색상 영상이 이미 왜곡 보정된 것이면 그 사실을 알려 달라. 규약이 아니라
-          확인 항목이다.
-        - **부른 순간의 자세에서 한 장.** 안에서 PiPER를 움직이지 않는다.
+        깊이 0 및 비유한 값은 nan으로 바꾼다. 색상에는 추가 왜곡 보정을 하지 않는다.
+        최신 수신 frameset을 사용하며 호출 순간의 촬영이나 RGB-depth 동시 노출은 보장하지 않는다.
+        안에서 로봇을 움직이지 않는다.
         """
         if self._closed:
             raise RuntimeError("RealRobot 연결이 닫혀 있다")
@@ -474,13 +457,12 @@ class RealRobot:
 
 # ==================== 실물 관절·카메라 형식 검사 ====================
 def check_shapes(bot) -> None:
-    """반환 형식이 규약과 맞는지만 본다. 값이 맞는지는 재생 시험이 본다."""
+    """형식·기본 값 범위·시각 증가를 검사하고, 현재 위치 지령을 보낸 뒤 연결을 닫는다."""
     j = bot.read_joints()
     assert set(j) >= {"nero", "piper", "grip", "t"}, f"키가 모자라다: {sorted(j)}"
     assert len(j["nero"]) == 7, f"nero 관절 {len(j['nero'])}개 (7이어야 한다)"
     assert len(j["piper"]) == 6, f"piper 관절 {len(j['piper'])}개 (6이어야 한다)"
-    # 그리퍼 구현 후 복원: 현재 grip은 임시값이다.
-    # assert 0.0 <= float(j["grip"]) <= 1.0, f"grip {j['grip']} (0-1이어야 한다)"
+    # 실제 그리퍼 피드백과 개폐 지령은 미구현이므로 검사하지 않는다.
     # rad인지 도인지 여기서 단정할 수는 없다. 다만 도라면 거의 확실히 범위를 넘는다.
     q = np.abs(np.r_[j["nero"], j["piper"]])
     if q.max() > 2.0 * np.pi:
@@ -509,10 +491,8 @@ def check_shapes(bot) -> None:
     assert hi < 30.0, f"깊이 최대 {hi:.1f} (m가 아니라 mm로 주고 있지 않은가)"
     assert lo > 0.02, f"깊이 최소 {lo:.4f} m. 센서 하한보다 작다"
 
-    # 나머지 세 함수도 최소한 불러 본다. 반환값이 없어 형식은 못 보지만, 부르면 죽는
-    # 구현과 close를 두 번 못 견디는 구현이 여기서 걸린다.
+    # 실제 위치 지령 전송과 close의 반복 호출을 확인한다.
     bot.command_joints(bot.read_joints())   # 방금 읽은 값을 그대로 = 제자리 지령
-    # bot.set_gripper(0.0)                  # 그리퍼 구현 후 복원: 개방
     t0 = bot.read_joints()["t"]
     time.sleep(0.05)
     assert bot.read_joints()["t"] > t0, "t가 증가하지 않는다"
