@@ -44,7 +44,7 @@ def connect_cameras(bot, metadata):
     devices = bot._camera_context.query_devices()
     metadata["orbbec_core_version"] = str(sdk.get_version())
     for role, pid, height, fmt in (("wrist", 0x0840, 800, sdk.OBFormat.YUYV),
-                                  ("gaze", 0x0800, 720, sdk.OBFormat.MJPG)):
+                                  ("gaze", 0x0800, 720, sdk.OBFormat.YUYV)):
         matches = [i for i in range(devices.get_count()) if devices.get_device_pid_by_index(i) == pid]
         if len(matches) != 1:
             raise RuntimeError(f"{role}: expected exactly one camera, found {len(matches)}")

@@ -140,7 +140,7 @@ class RealRobot:
                 # 두 색상 스트림 모두 명시한 원본 모드만 사용한다. 기본값 대체/resize 없음.
                 width, height, color_format, fps = (
                     (1280, 800, sdk.OBFormat.YUYV, 30) if role == "wrist"
-                    else (1280, 720, sdk.OBFormat.MJPG, 30))
+                    else (1280, 720, sdk.OBFormat.YUYV, 30))
                 requested_mode = f"{width}x{height} {color_format} {fps}fps"
                 try:
                     color_profile = color_profiles.get_video_stream_profile(
